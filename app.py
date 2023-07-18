@@ -1,105 +1,118 @@
 import streamlit as st
+import os
 from dotenv import load_dotenv
-from PyPDF2 import PdfReader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings, HuggingFaceInstructEmbeddings
-from langchain.vectorstores import FAISS
+from langchain.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
 from langchain.chat_models import ChatOpenAI
-from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
-from htmlTemplates import css, bot_template, user_template
-from langchain.llms import HuggingFaceHub
+from langchain.text_splitter import CharacterTextSplitter
 
-def get_pdf_text(pdf_docs):
-    text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text
+# Load environment variables from .env file
+load_dotenv('.env')
 
+@st.cache(allow_output_mutation=True)
+def load_documents():
+    documents = []
+    # Create a List of Documents from all of our files in the ./docs folder
+    for file in os.listdir("docs"):
+        if file.endswith(".pdf"):
+            pdf_path = os.path.join("docs", file)
+            loader = PyPDFLoader(pdf_path)
+            documents.extend(loader.load())
+        elif file.endswith('.docx') or file.endswith('.doc'):
+            doc_path = os.path.join("docs", file)
+            loader = Docx2txtLoader(doc_path)
+            documents.extend(loader.load())
+        elif file.endswith('.txt'):
+            text_path = os.path.join("docs", file)
+            loader = TextLoader(text_path)
+            documents.extend(loader.load())
 
-def get_text_chunks(text):
-    text_splitter = CharacterTextSplitter(
-        separator="\n",
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
-    )
-    chunks = text_splitter.split_text(text)
-    return chunks
+    # Split the documents into smaller chunks
+    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=10)
+    documents = text_splitter.split_documents(documents)
 
+    # Convert the document chunks to embeddings and save them to the vector store
+    vectordb = Chroma.from_documents(documents, embedding=OpenAIEmbeddings(), persist_directory="./data")
+    vectordb.persist()
 
-def get_vectorstore(text_chunks):
-    embeddings = OpenAIEmbeddings()
-    # embeddings = HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-xl")
-    vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
-    return vectorstore
-
-
-def get_conversation_chain(vectorstore):
-    llm = ChatOpenAI(model="gpt-3.5-turbo-16k", temperature=0)
-    # llm = HuggingFaceHub(repo_id="google/flan-t5-xxl", model_kwargs={"temperature":0.5, "max_length":512})
-
-    memory = ConversationBufferMemory(
-        memory_key='chat_history', return_messages=True)
-    conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(),
-        memory=memory,
-        return_source_documents=True
-    )
-    return conversation_chain
-
-
-def handle_userinput(user_question):
-    response = st.session_state.conversation({'question': user_question})
-    st.session_state.chat_history = response['chat_history']
-
-    for i, message in enumerate(st.session_state.chat_history):
-        if i % 2 == 0:
-            st.write(user_template.replace(
-                "{{MSG}}", message.content), unsafe_allow_html=True)
-        else:
-            st.write(bot_template.replace(
-                "{{MSG}}", message.content), unsafe_allow_html=True)
-
+    return vectordb
 
 def main():
-    load_dotenv()
-    st.set_page_config(page_title="Chat with multiple PDFs",
-                       page_icon=":books:")
-    st.write(css, unsafe_allow_html=True)
+    st.set_page_config(page_title="Chat with Multiple Documents", page_icon=":books:")
+    st.write("<style>div.row-widget.stRadio > div{flex-direction:row;}</style>", unsafe_allow_html=True)
+
+    st.header("Chat with Multiple Documents :books:")
+
+    # Load or create the vector store
+    vectorstore = load_documents()
+
+    # Create the conversation chain
+    pdf_qa = ConversationalRetrievalChain.from_llm(
+        ChatOpenAI(temperature=0, model_name='gpt-3.5-turbo-16k'),
+        retriever=vectorstore.as_retriever(search_kwargs={'k': 6}),
+        return_source_documents=True,
+        verbose=False
+    )
 
     if "conversation" not in st.session_state:
         st.session_state.conversation = None
     if "chat_history" not in st.session_state:
-        st.session_state.chat_history = None
+        st.session_state.chat_history = []
 
-    st.header("Chat with multiple PDFs :books:")
     user_question = st.text_input("Ask a question about your documents:")
-    if user_question:
-        handle_userinput(user_question)
+
+    if st.button("Ask"):
+        if user_question:
+            response = pdf_qa(
+                {"question": user_question, "chat_history": st.session_state.chat_history}
+            )
+            st.session_state.chat_history.append(
+                (user_question, response["answer"])
+            )
+
+    for query, answer in st.session_state.chat_history:
+        if query:
+            st.write(f"User: {query}")
+        st.write(f"Bot: {answer}")
 
     with st.sidebar:
         st.subheader("Your documents")
         pdf_docs = st.file_uploader(
-            "Upload your PDFs here and click on 'Process'", accept_multiple_files=True)
+            "Upload your PDFs, DOCs, or TXTs here and click on 'Process'",
+            accept_multiple_files=True
+        )
         if st.button("Process"):
-            with st.spinner("Processing"):
-                # get pdf text
-                raw_text = get_pdf_text(pdf_docs)
+            if pdf_docs:
+                with st.spinner("Processing"):
+                    # Extract text from uploaded documents
+                    raw_text = ""
+                    for pdf in pdf_docs:
+                        if pdf.name.endswith(".pdf"):
+                            pdf_reader = PyPDFLoader(pdf)
+                            raw_text += " ".join(pdf_reader.load())
+                        elif pdf.name.endswith('.docx') or pdf.name.endswith('.doc'):
+                            doc_reader = Docx2txtLoader(pdf)
+                            raw_text += " ".join(doc_reader.load())
+                        elif pdf.name.endswith('.txt'):
+                            text_reader = TextLoader(pdf)
+                            raw_text += " ".join(text_reader.load())
 
-                # get the text chunks
-                text_chunks = get_text_chunks(raw_text)
+                    # Split the text into chunks
+                    text_chunks = CharacterTextSplitter(
+                        chunk_size=1000, chunk_overlap=10).split_text(raw_text)
 
-                # create vector store
-                vectorstore = get_vectorstore(text_chunks)
+                    # Update the vector store
+                    vectorstore.update_from_texts(texts=text_chunks)
 
-                # create conversation chain
-                st.session_state.conversation = get_conversation_chain(
-                    vectorstore)
-
+                    # Update the conversation chain
+                    st.session_state.conversation = ConversationalRetrievalChain.from_llm(
+                        ChatOpenAI(temperature=0.7, model_name='gpt-3.5-turbo'),
+                        retriever=vectorstore.as_retriever(search_kwargs={'k': 6}),
+                        return_source_documents=True,
+                        verbose=False
+                    )
 
 if __name__ == '__main__':
     main()
